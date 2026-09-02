@@ -40,6 +40,17 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("absensi-notifier")
 
+# jika HTTP_PROXY mengarah ke gluetun tapi gluetun tidak jalan (tanpa --profile vpn), fallback ke direct
+if os.getenv("HTTP_PROXY", "").find("gluetun") != -1:
+    try:
+        import socket
+
+        socket.gethostbyname("gluetun")
+    except Exception:
+        log.warning("HTTP_PROXY gluetun tidak terjangkau (jalan tanpa --profile vpn?) -> fallback direct tanpa proxy")
+        for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            os.environ.pop(k, None)
+
 # ── KONFIGURASI — wajib via .env, tidak ada default kredensial di code ──────
 NETID = os.getenv("NETID", "")
 PASSWORD = os.getenv("PASSWORD", "")
@@ -85,6 +96,9 @@ STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "180"))
 SEND_FIRST_RUN_TEST = os.getenv("SEND_FIRST_RUN_TEST", "true").lower() in ("1", "true", "ya", "yes")
 SEND_FIRST_RUN_TEST_COUNT = int(os.getenv("SEND_FIRST_RUN_TEST_COUNT", "3"))  # 2 atau 3 untuk testing multi
+WA_NOTIFY_ERROR = os.getenv("WA_NOTIFY_ERROR", "true").lower() in ("1", "true", "ya", "yes")
+WA_NOTIFY_ERROR_COOLDOWN = int(os.getenv("WA_NOTIFY_ERROR_COOLDOWN", "3600"))  # detik, anti spam error
+_last_error_wa = 0
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
@@ -93,9 +107,23 @@ class LoginFailed(Exception):
     pass
 
 
+def _request(session: requests.Session, method: str, url: str, **kwargs):
+    """Wrapper request dengan fallback direct jika proxy gluetun gagal."""
+    try:
+        return getattr(session, method)(url, **kwargs)
+    except requests.exceptions.ProxyError as e:
+        if "gluetun" in str(e):
+            log.warning("Proxy gluetun gagal (%s) -> retry direct tanpa proxy", e)
+            kwargs["proxies"] = {"http": None, "https": None}
+            return getattr(session, method)(url, **kwargs)
+        raise
+
+
 def new_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": UA})
+    # hormati NO_PROXY untuk wa-gateway
+    s.trust_env = True
     return s
 
 
@@ -103,7 +131,13 @@ def login(session: requests.Session) -> None:
     """Ikuti flow CAS lengkap sampai session dapat cookie `token` dari ethol."""
     # Step 1: GET cas-redirect (akan redirect ke https://login.pens.ac.id/cas/login?service=...)
     # requests akan follow redirect otomatis, jadi kita dapat HTML CAS langsung
-    r = session.get(CAS_REDIRECT_URL, timeout=15, allow_redirects=True)
+    try:
+        r = _request(session, "get", CAS_REDIRECT_URL, timeout=15, allow_redirects=True)
+    except requests.exceptions.ProxyError as e:
+        _notify_error_wa("Proxy gluetun error saat login CAS", str(e)[:300])
+        raise
+    if r.status_code in (403, 429):
+        _notify_error_wa(f"Ethol block {r.status_code} saat CAS redirect", f"URL: {CAS_REDIRECT_URL}")
     r.raise_for_status()
 
     if 'id="fm1"' not in r.text or 'name="lt"' not in r.text:
@@ -138,7 +172,7 @@ def login(session: requests.Session) -> None:
 
     # Step 2: POST ke CAS login (akan redirect 302 ke /api/auth/cas-callback?ticket=ST-xxx)
     # lalu cas-callback akan set cookie `token` dan redirect lagi ke ethol
-    r2 = session.post(login_post_url, data=payload, timeout=15, allow_redirects=True)
+    r2 = _request(session, "post", login_post_url, data=payload, timeout=15, allow_redirects=True)
     r2.raise_for_status()
 
     cookies = session.cookies.get_dict()
@@ -155,7 +189,13 @@ def login(session: requests.Session) -> None:
 
 
 def fetch_notifikasi(session: requests.Session) -> list[dict]:
-    r = session.get(NOTIF_URL, timeout=15)
+    try:
+        r = _request(session, "get", NOTIF_URL, timeout=15)
+    except requests.exceptions.ProxyError as e:
+        _notify_error_wa("Proxy gluetun error saat fetch notifikasi", str(e)[:300])
+        raise
+    if r.status_code in (403, 429):
+        _notify_error_wa(f"Ethol block {r.status_code} saat fetch notifikasi", f"URL: {NOTIF_URL} | Response: {r.text[:300]}")
     if r.status_code == 401:
         raise LoginFailed("Token expired (401 dari API notifikasi).")
     r.raise_for_status()
@@ -195,6 +235,29 @@ def save_seen_ids(ids: set) -> None:
                 pass
     except Exception as e:
         log.error("Gagal save state.json (%s): %s", STATE_FILE, e)
+
+
+def _should_notify_error() -> bool:
+    """Rate limit notif error WA biar tidak spam."""
+    global _last_error_wa
+    if not WA_NOTIFY_ERROR:
+        return False
+    now = time.time()
+    if now - _last_error_wa < WA_NOTIFY_ERROR_COOLDOWN:
+        return False
+    _last_error_wa = now
+    return True
+
+
+def _notify_error_wa(judul: str, detail: str) -> None:
+    """Kirim notifikasi error ke WA (dipakai untuk 403/429, login gagal, proxy down, dll)."""
+    if not _should_notify_error():
+        log.info("Skip notif error WA (cooldown %ds): %s", WA_NOTIFY_ERROR_COOLDOWN, judul)
+        return
+    msg = f"⚠️ *ETHOL ERROR*\n{judul}\n\nDetail: {detail}\n\nWaktu: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nCek: docker logs -f ethol_notifier"
+    # WA error tetap coba direct tanpa proxy biar pasti masuk (jangan lewat gluetun yang mungkin down)
+    # pakai send_whatsapp tapi force tanpa proxy sudah dihandle di _request, jadi panggil langsung
+    send_whatsapp(msg)
 
 
 def send_whatsapp(message: str) -> None:
@@ -269,7 +332,7 @@ def _fetch_presensi_key(session: requests.Session, kuliah: int, jenis_schema: in
     ]
     for url in candidates:
         try:
-            r = session.get(url, timeout=10)
+            r = _request(session, "get", url, timeout=10)
             if r.ok:
                 j = r.json()
                 if isinstance(j, list):
@@ -305,10 +368,10 @@ def _check_riwayat_presensi(session: requests.Session, kuliah: int, jenis_schema
     """Cek apakah sudah absen via GET /api/presensi/riwayat?kuliah=... True = sudah absen, skip auto."""
     try:
         url = f"{BASE_URL}/api/presensi/riwayat?kuliah={kuliah}&jenis_schema={jenis_schema}&nomor={mahasiswa}"
-        r = session.get(url, timeout=10)
+        r = _request(session, "get", url, timeout=10)
         if r.status_code == 304:
             # 304 = cache, anggap sudah pernah fetch, coba tanpa If-None-Match
-            r = session.get(url, headers={"If-None-Match": ""}, timeout=10)
+            r = _request(session, "get", url, headers={"If-None-Match": ""}, timeout=10)
         if r.ok:
             j = r.json()
             if isinstance(j, list) and len(j) > 0:
@@ -364,7 +427,7 @@ def _do_auto_presensi(session: requests.Session, notif: dict) -> tuple[bool, str
     # kuliah_asal tidak ada di /aktif-kuliah, coba ambil via matakuliah detail jika masih None
     if not kuliah_asal:
         try:
-            r2 = session.get(f"{BASE_URL}/api/matakuliah/{kuliah}", timeout=10)
+            r2 = _request(session, "get", f"{BASE_URL}/api/matakuliah/{kuliah}", timeout=10)
             if r2.ok:
                 j2 = r2.json()
                 # bisa langsung dict atau nested
@@ -386,7 +449,7 @@ def _do_auto_presensi(session: requests.Session, notif: dict) -> tuple[bool, str
 
     log.info("🚀 Auto presensi: POST %s payload=%s", f"{BASE_URL}/api/presensi/mahasiswa", payload)
     try:
-        r = session.post(f"{BASE_URL}/api/presensi/mahasiswa", json=payload, timeout=15)
+        r = _request(session, "post", f"{BASE_URL}/api/presensi/mahasiswa", json=payload, timeout=15)
         j = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
         if r.ok and j.get("sukses"):
             return True, j.get("pesan", "Presensi berhasil disimpan")
@@ -604,15 +667,28 @@ def main() -> None:
             save_seen_ids(seen_ids)
         except LoginFailed as e:
             log.warning("Sesi bermasalah (%s) -> login ulang.", e)
+            _notify_error_wa("Login CAS gagal / token expired", str(e)[:400])
             session = new_session()
             try:
                 login(session)
             except LoginFailed as le:
                 log.error("Login ulang gagal: %s -> retry 30 detik", le)
+                _notify_error_wa("Login ulang gagal 2x", str(le)[:400])
                 time.sleep(30)
             continue
+        except requests.exceptions.ProxyError as e:
+            log.error("Proxy error (gluetun down?): %s", e)
+            _notify_error_wa("Proxy gluetun down / DNS gagal", str(e)[:400] + "\nSolusi: docker compose up -d (tanpa proxy) atau --profile vpn")
+            time.sleep(30)
+            continue
         except Exception as e:
+            msg = str(e)
+            is_block = "403" in msg or "429" in msg or "block" in msg.lower()
             log.error("Error polling: %s", e, exc_info=True)
+            if is_block or "Max retries" in msg:
+                _notify_error_wa("Ethol polling error (mungkin IP ter-block)", msg[:500])
+            else:
+                _notify_error_wa("Ethol polling error umum", msg[:500])
 
         time.sleep(POLL_INTERVAL_SECONDS)
 

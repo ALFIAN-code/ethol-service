@@ -34,7 +34,7 @@ services:
     volumes:
       - ethol_state:/app/data
 
-  # ── Gluetun VPN (berbayar/Proton custom, aktifkan: docker compose --profile vpn up -d) ──
+  # ── Gluetun VPN (rotate IP, aktifkan: docker compose --profile vpn up -d) ──
   gluetun:
     image: qmcgaw/gluetun:latest
     container_name: gluetun
@@ -44,21 +44,26 @@ services:
       - /dev/net/tun
     ports:
       - "8888:8888/tcp"
+      - "8000:8000/tcp" # gluetun control server (untuk rotate manual)
     environment:
-      - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER:-custom}
-      - VPN_TYPE=${VPN_TYPE:-wireguard}
+      - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER:-protonvpn}
+      - VPN_TYPE=${VPN_TYPE:-openvpn}
+      # WireGuard custom (single endpoint, tidak rotate) — isi jika VPN_SERVICE_PROVIDER=custom
       - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY:-}
       - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES:-}
       - WIREGUARD_PUBLIC_KEY=${WIREGUARD_PUBLIC_KEY:-}
       - WIREGUARD_ENDPOINT_IP=${WIREGUARD_ENDPOINT_IP:-}
       - WIREGUARD_ENDPOINT_PORT=${WIREGUARD_ENDPOINT_PORT:-}
-      - WIREGUARD_TOKEN=${WIREGUARD_TOKEN:-}
-      - SERVER_COUNTRIES=${SERVER_COUNTRIES:-}
+      # Proton OpenVPN (rotate, gratis) — isi OPENVPN_USER/PASSWORD dari Proton -> OpenVPN/IKEv2
       - OPENVPN_USER=${OPENVPN_USER:-}
       - OPENVPN_PASSWORD=${OPENVPN_PASSWORD:-}
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES:-Netherlands, Singapore, United States}
+      - SERVER_CITIES=${SERVER_CITIES:-}
+      - FREE_ONLY=${FREE_ONLY:-on}
       - HTTPPROXY=on
       - HTTPPROXY_LOG=off
       - HEALTH_VPN_DURATION_INITIAL=30s
+      - DOT=off
     volumes:
       - gluetun:/gluetun
     restart: unless-stopped
