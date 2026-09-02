@@ -35,7 +35,8 @@ try:
 except ImportError:
     pass
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("absensi-notifier")
 
 # ── KONFIGURASI — wajib via .env, tidak ada default kredensial di code ──────
@@ -223,9 +224,32 @@ def format_message(notif: dict) -> str:
     return f"{emoji} *{kode}*\n{ket}\n\nWaktu: {waktu}\nLink: {link}"
 
 
+def _log_notif_data(tag: str, notifs: list[dict]) -> None:
+    """Print isi data notifikasi ke log biar kelihatan jelas."""
+    if not notifs:
+        log.info("[%s] kosong", tag)
+        return
+    log.info("[%s] %d data:", tag, len(notifs))
+    for n in notifs:
+        # pretty print 1 baris per notif
+        log.info(
+            "  • %s | %s | %s | %s | id=%s",
+            n.get("kodeNotifikasi"),
+            n.get("createdAtIndonesia", n.get("waktuNotifikasi")),
+            n.get("keterangan", "")[:90],
+            n.get("urlWeb"),
+            n.get("idNotifikasi", "")[:8],
+        )
+    # dump JSON lengkap di level DEBUG (aktifkan via LOG_LEVEL=DEBUG)
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug(json.dumps(notifs, indent=2, ensure_ascii=False))
+
+
 def run_once(session: requests.Session, seen_ids: set) -> set:
     notifikasi = fetch_notifikasi(session)
     log.info("Fetch %d notifikasi dari API.", len(notifikasi))
+    _log_notif_data("SEMUA", notifikasi)
+
     baru = [
         n
         for n in notifikasi
@@ -233,9 +257,12 @@ def run_once(session: requests.Session, seen_ids: set) -> set:
         and n["idNotifikasi"] not in seen_ids
     ]
 
+    if baru:
+        _log_notif_data("BARU (akan dikirim WA)", sorted(baru, key=lambda x: x["createdAt"]))
     for n in sorted(baru, key=lambda x: x["createdAt"]):
-        log.info("Notifikasi baru: %s | %s", n["kodeNotifikasi"], n["keterangan"])
-        send_whatsapp(format_message(n))
+        msg = format_message(n)
+        log.info("→ Kirim WA:\n%s", msg)
+        send_whatsapp(msg)
         seen_ids.add(n["idNotifikasi"])
 
     if not baru:
@@ -261,6 +288,7 @@ def main() -> None:
         log.info("Run pertama / state kosong: menyimpan baseline tanpa kirim WA (biar tidak spam notifikasi lama).")
         try:
             notifikasi = fetch_notifikasi(session)
+            _log_notif_data("BASELINE (disimpan, tidak dikirim WA)", notifikasi)
             seen_ids = {n["idNotifikasi"] for n in notifikasi}
             save_seen_ids(seen_ids)
             log.info("Baseline %d notifikasi disimpan. Menunggu polling...", len(seen_ids))
