@@ -82,6 +82,7 @@ else:
 STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "180"))
 SEND_FIRST_RUN_TEST = os.getenv("SEND_FIRST_RUN_TEST", "true").lower() in ("1", "true", "ya", "yes")
+SEND_FIRST_RUN_TEST_COUNT = int(os.getenv("SEND_FIRST_RUN_TEST_COUNT", "3"))  # 2 atau 3 untuk testing multi
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
@@ -295,7 +296,7 @@ def _wait_wa_ready(timeout: int = 30) -> bool:
 
 
 def _send_first_run_test(notifikasi: list[dict]) -> None:
-    """Kirim 1 notifikasi terbaru hari ini sebagai test saat pertama jalan."""
+    """Kirim 2-3 notifikasi terbaru hari ini sebagai test saat pertama jalan."""
     if not notifikasi or not SEND_FIRST_RUN_TEST:
         return
     today = _today_wib()
@@ -306,14 +307,35 @@ def _send_first_run_test(notifikasi: list[dict]) -> None:
     if not candidates:
         log.info("Tidak ada notifikasi hari ini (%s) untuk test pertama — skip kirim test.", today)
         return
-    latest = max(candidates, key=lambda x: x.get("createdAt", ""))
-    log.info("🧪 Test pertama: kirim notifikasi terbaru hari ini (%s) sebagai verifikasi WA", today)
-    _log_notif_data("TEST HARI INI (dikirim sebagai verifikasi)", [latest])
-    # tunggu WA gateway ready biar tidak race dengan restart
+    # ambil N terbaru hari ini; kalau hari ini < N, lengkapi dari hari sebelumnya biar tetap test multi
+    need = max(1, SEND_FIRST_RUN_TEST_COUNT)
+    candidates = sorted(candidates, key=lambda x: x.get("createdAt", ""), reverse=True)
+    if len(candidates) < need:
+        # fallback: ambil terbaru overall untuk melengkapi
+        all_sorted = sorted(notifikasi, key=lambda x: x.get("createdAt", ""), reverse=True)
+        seen = {c.get("idNotifikasi") for c in candidates}
+        for n in all_sorted:
+            if n.get("idNotifikasi") not in seen:
+                candidates.append(n)
+                seen.add(n.get("idNotifikasi"))
+            if len(candidates) >= need:
+                break
+        candidates = candidates[:need]
+        log.info("Hari ini hanya %d notif, dilengkapi dari hari sebelumnya jadi %d untuk test multi", len(today_notifs), len(candidates))
+    else:
+        candidates = candidates[:need]
+    # kirim dari yang terlama ke terbaru biar urutan chat natural (kebalikan reverse)
+    candidates = list(reversed(candidates))
+    log.info("🧪 Test pertama: kirim %d notifikasi terbaru hari ini (%s) sebagai verifikasi WA", len(candidates), today)
+    _log_notif_data(f"TEST HARI INI ({len(candidates)} dikirim sebagai verifikasi)", candidates)
     if not _wait_wa_ready(30):
         log.warning("WA gateway belum connected setelah 30s — test akan dikirim tetap, mungkin gagal. Scan QR di http://localhost:3000/qr")
-    test_msg = "🧪 *TEST - Notifikasi terbaru hari ini*\n\n" + format_message(latest)
-    send_whatsapp(test_msg)
+    for idx, n in enumerate(candidates, 1):
+        test_msg = f"🧪 *TEST {idx}/{len(candidates)} - Notifikasi terbaru hari ini*\n\n" + format_message(n)
+        log.info("→ Test %d/%d: %s | %s", idx, len(candidates), n.get("kodeNotifikasi"), n.get("keterangan", "")[:60])
+        send_whatsapp(test_msg)
+        if idx < len(candidates):
+            time.sleep(1.5)  # jeda biar tidak rate-limit
 
 
 def _log_notif_data(tag: str, notifs: list[dict]) -> None:
