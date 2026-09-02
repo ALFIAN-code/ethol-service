@@ -278,23 +278,40 @@ def _notif_date_wib(notif: dict) -> str | None:
         return None
 
 
+def _wait_wa_ready(timeout: int = 30) -> bool:
+    """Tunggu wa-gateway sampai connected, polling /status."""
+    if not WA_GATEWAY_URL:
+        return True
+    url = f"{WA_GATEWAY_URL.rstrip('/')}/status"
+    for _ in range(timeout):
+        try:
+            r = requests.get(url, timeout=3)
+            if r.ok and r.json().get("connected"):
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
+
+
 def _send_first_run_test(notifikasi: list[dict]) -> None:
     """Kirim 1 notifikasi terbaru hari ini sebagai test saat pertama jalan."""
     if not notifikasi or not SEND_FIRST_RUN_TEST:
         return
     today = _today_wib()
     today_notifs = [n for n in notifikasi if _notif_date_wib(n) == today]
-    # filter sesuai KODE_YANG_DIPANTAU juga
     if KODE_YANG_DIPANTAU is not None:
         today_notifs = [n for n in today_notifs if n.get("kodeNotifikasi") in KODE_YANG_DIPANTAU]
     candidates = today_notifs if today_notifs else []
     if not candidates:
         log.info("Tidak ada notifikasi hari ini (%s) untuk test pertama — skip kirim test.", today)
         return
-    # ambil yang paling terbaru
     latest = max(candidates, key=lambda x: x.get("createdAt", ""))
     log.info("🧪 Test pertama: kirim notifikasi terbaru hari ini (%s) sebagai verifikasi WA", today)
     _log_notif_data("TEST HARI INI (dikirim sebagai verifikasi)", [latest])
+    # tunggu WA gateway ready biar tidak race dengan restart
+    if not _wait_wa_ready(30):
+        log.warning("WA gateway belum connected setelah 30s — test akan dikirim tetap, mungkin gagal. Scan QR di http://localhost:3000/qr")
     test_msg = "🧪 *TEST - Notifikasi terbaru hari ini*\n\n" + format_message(latest)
     send_whatsapp(test_msg)
 
