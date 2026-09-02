@@ -76,17 +76,37 @@ app.get('/qr.txt', (req, res) => {
   res.type('text').send(qrString);
 });
 
+function toJid(input) {
+  // support: 628xxx, 08xxx, 628xxx@s.whatsapp.net, 120363xxx@g.us (grup)
+  const raw = String(input).trim();
+  if (raw.includes('@g.us') || raw.includes('@s.whatsapp.net')) return raw;
+  // grup ID biasanya ada '-' atau 12 digit, tapi kita deteksi g.us jika user tulis tanpa domain
+  // kalau input mengandung '-' atau panjang >16, anggap grup? default tetap phone
+  let jid = raw.replace(/[^0-9]/g, '');
+  if (jid.startsWith('08')) jid = '62' + jid.slice(1);
+  return jid + '@s.whatsapp.net';
+}
+
+app.get('/groups', async (req, res) => {
+  if (!isConnected || !sock) return res.status(503).json({ error: 'whatsapp not connected' });
+  try {
+    const groups = await sock.groupFetchAllParticipating();
+    const list = Object.values(groups).map(g => ({ id: g.id, subject: g.subject, participants: g.participants.length }));
+    res.json(list);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 app.post('/send', async (req, res) => {
   const { number, text } = req.body;
   if (!number || !text) return res.status(400).json({ error: 'number & text required' });
   if (!isConnected || !sock) return res.status(503).json({ error: 'whatsapp not connected, scan QR dulu di /qr atau lihat log' });
-  let jid = number.replace(/\D/g, '');
-  if (jid.startsWith('08')) jid = '62' + jid.slice(1);
-  if (!jid.includes('@')) jid = jid + '@s.whatsapp.net';
+  const jid = toJid(number);
   try {
     const result = await sock.sendMessage(jid, { text });
     logger.info({ jid, id: result?.key?.id }, 'pesan terkirim');
-    res.json({ ok: true, id: result?.key?.id });
+    res.json({ ok: true, id: result?.key?.id, jid });
   } catch (e) {
     logger.error(e, 'gagal kirim');
     res.status(500).json({ error: String(e) });

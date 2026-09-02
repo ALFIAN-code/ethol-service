@@ -55,6 +55,7 @@ EVOLUTION_BASE_URL = os.getenv("EVOLUTION_BASE_URL", "http://localhost:8080")
 EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "absensi-notifier")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
 WA_TARGET = os.getenv("WA_TARGET", "")
+WA_TARGETS = [t.strip() for t in WA_TARGET.split(",") if t.strip()] if WA_TARGET else []
 
 # Filter notifikasi: None = semua, atau set seperti {"PRESENSI-KULIAH"}
 # Bisa diisi via env: KODE_YANG_DIPANTAU=PRESENSI-KULIAH,TUGAS-BARU
@@ -196,42 +197,47 @@ def save_seen_ids(ids: set) -> None:
 
 
 def send_whatsapp(message: str) -> None:
-    """Kirim WA via Baileys gateway (prioritas) lalu fallback ke Evolution."""
-    # 1. Coba Baileys gateway ringan
-    if WA_GATEWAY_URL:
+    """Kirim WA via Baileys gateway (prioritas) lalu fallback ke Evolution. Support multi target (personal + grup)."""
+    targets = WA_TARGETS if WA_TARGETS else [WA_TARGET]
+    for target in targets:
+        sent = False
+        # 1. Coba Baileys gateway ringan
+        if WA_GATEWAY_URL:
+            try:
+                url = f"{WA_GATEWAY_URL.rstrip('/')}/send"
+                headers = {"Content-Type": "application/json"}
+                if WA_GATEWAY_API_KEY:
+                    headers["x-api-key"] = WA_GATEWAY_API_KEY
+                resp = requests.post(
+                    url,
+                    headers=headers,
+                    json={"number": target, "text": message},
+                    timeout=15,
+                )
+                if resp.status_code in (200, 201):
+                    log.info("Notifikasi WA terkirim via Baileys gateway ke %s.", target)
+                    sent = True
+                else:
+                    log.warning("Baileys gateway gagal ke %s (%s): %s -> coba fallback Evolution", target, resp.status_code, resp.text)
+            except Exception as e:
+                log.warning("Gagal hit Baileys gateway ke %s (%s) -> coba fallback Evolution", target, e)
+            if sent:
+                continue
+
+        # 2. Fallback Evolution API
         try:
-            url = f"{WA_GATEWAY_URL.rstrip('/')}/send"
-            headers = {"Content-Type": "application/json"}
-            if WA_GATEWAY_API_KEY:
-                headers["x-api-key"] = WA_GATEWAY_API_KEY
             resp = requests.post(
-                url,
-                headers=headers,
-                json={"number": WA_TARGET, "text": message},
+                f"{EVOLUTION_BASE_URL.rstrip('/')}/message/sendText/{EVOLUTION_INSTANCE}",
+                headers={"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"},
+                json={"number": target, "text": message},
                 timeout=15,
             )
-            if resp.status_code in (200, 201):
-                log.info("Notifikasi WA terkirim via Baileys gateway.")
-                return
+            if resp.status_code not in (200, 201):
+                log.error("Gagal kirim WA via Evolution ke %s (%s): %s", target, resp.status_code, resp.text)
             else:
-                log.warning("Baileys gateway gagal (%s): %s -> coba fallback Evolution", resp.status_code, resp.text)
+                log.info("Notifikasi WA terkirim via Evolution API ke %s.", target)
         except Exception as e:
-            log.warning("Gagal hit Baileys gateway (%s) -> coba fallback Evolution", e)
-
-    # 2. Fallback Evolution API
-    try:
-        resp = requests.post(
-            f"{EVOLUTION_BASE_URL.rstrip('/')}/message/sendText/{EVOLUTION_INSTANCE}",
-            headers={"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"},
-            json={"number": WA_TARGET, "text": message},
-            timeout=15,
-        )
-        if resp.status_code not in (200, 201):
-            log.error("Gagal kirim WA via Evolution (%s): %s", resp.status_code, resp.text)
-        else:
-            log.info("Notifikasi WA terkirim via Evolution API.")
-    except Exception as e:
-        log.error("Gagal kirim WA via Evolution: %s", e)
+            log.error("Gagal kirim WA via Evolution ke %s: %s", target, e)
 
 
 def format_message(notif: dict) -> str:
@@ -389,10 +395,10 @@ def main() -> None:
     if not NETID or not PASSWORD:
         log.error("NETID/PASSWORD kosong. Isi .env dulu (lihat .env.example).")
         raise SystemExit(1)
-    if not WA_TARGET:
-        log.error("WA_TARGET kosong. Isi nomor tujuan di .env (format 628xxx).")
+    if not WA_TARGETS:
+        log.error("WA_TARGET kosong. Isi nomor tujuan di .env (628xxx atau 120363...@g.us untuk grup).")
         raise SystemExit(1)
-    log.info("NetID: %s | WA target: %s | Gateway: %s", NETID, WA_TARGET, WA_GATEWAY_URL or EVOLUTION_BASE_URL)
+    log.info("NetID: %s | WA target: %s | Gateway: %s", NETID, ", ".join(WA_TARGETS), WA_GATEWAY_URL or EVOLUTION_BASE_URL)
     session = new_session()
     login(session)
 

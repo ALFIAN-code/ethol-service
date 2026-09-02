@@ -231,6 +231,23 @@ curl -X POST http://localhost:3000/send -H "Content-Type: application/json" \
 ```
 Ganti `6281234567890` dengan `WA_TARGET` kamu.
 
+Tes ke grup:
+```bash
+# 1. Buat grup WA, undang nomor bot (yang scan QR) jadi anggota
+# 2. Lihat ID grup:
+curl http://localhost:3000/groups
+# akan muncul: [{"id":"120363123456789012@g.us","subject":"Nama Grup",...}]
+
+# 3. Ganti WA_TARGET di .env jadi ID grup:
+WA_TARGET=120363123456789012@g.us
+# atau multi target (personal + grup, pisah koma):
+WA_TARGET=6281234567890,120363123456789012@g.us
+
+docker compose up -d --build
+curl -X POST http://localhost:3000/send -H "Content-Type: application/json" \
+  -d '{"number":"120363123456789012@g.us","text":"tes ke grup"}'
+```
+
 ---
 
 ## 10. Perintah Sehari-hari (Copy-Paste Saja)
