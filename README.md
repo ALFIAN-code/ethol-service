@@ -53,6 +53,14 @@ docker --version
 docker compose version
 ```
 
+### windows
+bisa di lihat panduan install docker di dokumentasi resminya 
+
+```
+https://docs.docker.com/desktop/
+```
+
+
 > Cek berhasil: ketik `docker compose version` dan `docker --version` harus keluar angka versi, bukan error.
 
 ---

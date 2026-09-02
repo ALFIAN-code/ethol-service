@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -67,8 +68,20 @@ BASE_URL = "https://ethol.pens.ac.id"
 CAS_REDIRECT_URL = f"{BASE_URL}/api/auth/cas-redirect"
 NOTIF_URL = f"{BASE_URL}/api/notifikasi/mahasiswa?filterNotif=SEMUA"
 
-STATE_FILE = Path(__file__).parent / "state.json"
+_DATA_DIR = Path(__file__).parent / "data"
+# di Docker, /app/data adalah named volume; di lokal, pakai ./data atau ./state.json fallback
+if Path("/app/data").exists() or os.getenv("WA_GATEWAY_URL", "").startswith("http://wa-gateway"):
+    STATE_FILE = Path("/app/data/state.json")
+    _DATA_DIR = Path("/app/data")
+else:
+    STATE_FILE = Path(__file__).parent / "state.json"
+    # backward compat: kalau ada state.json lama di root, pakai itu
+    if not STATE_FILE.exists() and (Path(__file__).parent / "data" / "state.json").exists():
+        STATE_FILE = Path(__file__).parent / "data" / "state.json"
+
+STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "180"))
+SEND_FIRST_RUN_TEST = os.getenv("SEND_FIRST_RUN_TEST", "true").lower() in ("1", "true", "ya", "yes")
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
@@ -164,14 +177,21 @@ def load_seen_ids() -> set:
 
 def save_seen_ids(ids: set) -> None:
     try:
-        # jika state.json terlanjur jadi directory (bind mount bug), hapus dulu
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         if STATE_FILE.exists() and not STATE_FILE.is_file():
             import shutil
 
             shutil.rmtree(STATE_FILE)
         STATE_FILE.write_text(json.dumps(list(ids)))
+        # backward compat: hapus file lama di root jika pakai volume baru
+        _old = Path(__file__).parent / "state.json"
+        if STATE_FILE != _old and _old.is_file():
+            try:
+                _old.unlink()
+            except Exception:
+                pass
     except Exception as e:
-        log.error("Gagal save state.json: %s", e)
+        log.error("Gagal save state.json (%s): %s", STATE_FILE, e)
 
 
 def send_whatsapp(message: str) -> None:
@@ -222,6 +242,61 @@ def format_message(notif: dict) -> str:
     link = f"{BASE_URL}{url}" if url else "-"
     emoji = {"PRESENSI-KULIAH": "✅", "TUGAS-BARU": "📝", "PENGUMUMAN-BARU": "📢"}.get(kode, "🔔")
     return f"{emoji} *{kode}*\n{ket}\n\nWaktu: {waktu}\nLink: {link}"
+
+
+def _today_wib() -> str:
+    """Tanggal hari ini di WIB (Asia/Jakarta) format YYYY-MM-DD."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo("Asia/Jakarta")).date().isoformat()
+    except Exception:
+        # fallback UTC+7
+        return (datetime.now(timezone.utc) + timedelta(hours=7)).date().isoformat()
+
+
+def _notif_date_wib(notif: dict) -> str | None:
+    """Ambil tanggal notifikasi dalam WIB dari createdAt (UTC) atau createdAtIndonesia."""
+    # coba parse createdAt dulu (ISO8601 UTC)
+    created = notif.get("createdAt")
+    if created:
+        try:
+            # handle "2026-09-02T03:42:05.000Z"
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            wib = dt.astimezone(timezone(timedelta(hours=7)))
+            return wib.date().isoformat()
+        except Exception:
+            pass
+    # fallback parse createdAtIndonesia: "Rabu, 02 September 2026 - 10:42"
+    indo = notif.get("createdAtIndonesia", "")
+    try:
+        # ambil "02 September 2026"
+        part = indo.split(",")[-1].split("-")[0].strip()  # "02 September 2026"
+        dt = datetime.strptime(part, "%d %B %Y")
+        return dt.date().isoformat()
+    except Exception:
+        return None
+
+
+def _send_first_run_test(notifikasi: list[dict]) -> None:
+    """Kirim 1 notifikasi terbaru hari ini sebagai test saat pertama jalan."""
+    if not notifikasi or not SEND_FIRST_RUN_TEST:
+        return
+    today = _today_wib()
+    today_notifs = [n for n in notifikasi if _notif_date_wib(n) == today]
+    # filter sesuai KODE_YANG_DIPANTAU juga
+    if KODE_YANG_DIPANTAU is not None:
+        today_notifs = [n for n in today_notifs if n.get("kodeNotifikasi") in KODE_YANG_DIPANTAU]
+    candidates = today_notifs if today_notifs else []
+    if not candidates:
+        log.info("Tidak ada notifikasi hari ini (%s) untuk test pertama — skip kirim test.", today)
+        return
+    # ambil yang paling terbaru
+    latest = max(candidates, key=lambda x: x.get("createdAt", ""))
+    log.info("🧪 Test pertama: kirim notifikasi terbaru hari ini (%s) sebagai verifikasi WA", today)
+    _log_notif_data("TEST HARI INI (dikirim sebagai verifikasi)", [latest])
+    test_msg = "🧪 *TEST - Notifikasi terbaru hari ini*\n\n" + format_message(latest)
+    send_whatsapp(test_msg)
 
 
 def _log_notif_data(tag: str, notifs: list[dict]) -> None:
@@ -285,13 +360,16 @@ def main() -> None:
     seen_ids = load_seen_ids()
     # baseline jika file belum ada, kosong, atau invalid -> jangan spam WA lama
     if not STATE_FILE.is_file() or len(seen_ids) == 0:
-        log.info("Run pertama / state kosong: menyimpan baseline tanpa kirim WA (biar tidak spam notifikasi lama).")
+        log.info("Run pertama / state kosong: menyimpan baseline + kirim 1 test hari ini untuk verifikasi.")
         try:
             notifikasi = fetch_notifikasi(session)
-            _log_notif_data("BASELINE (disimpan, tidak dikirim WA)", notifikasi)
+            _log_notif_data("BASELINE (disimpan)", notifikasi)
             seen_ids = {n["idNotifikasi"] for n in notifikasi}
             save_seen_ids(seen_ids)
-            log.info("Baseline %d notifikasi disimpan. Menunggu polling...", len(seen_ids))
+            log.info("Baseline %d notifikasi disimpan.", len(seen_ids))
+            # kirim 1 notifikasi terbaru hari ini sebagai test (biar ketahuan WA jalan)
+            _send_first_run_test(notifikasi)
+            log.info("Menunggu polling selanjutnya tiap %ds...", POLL_INTERVAL_SECONDS)
             log.info(
                 "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "✅ Ethol notifier jalan! Cek QR WA di:\n"

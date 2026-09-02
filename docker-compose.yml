@@ -24,7 +24,7 @@ services:
       # fallback kalau .env tidak ada, override di sini
       - WA_GATEWAY_URL=http://wa-gateway:3000
     volumes:
-      - ./state.json:/app/state.json
+      - ethol_state:/app/data
 
   # Opsional: kalau masih mau pakai Evolution API lama, uncomment ini
   # evolution-api:
@@ -40,4 +40,5 @@ services:
 
 volumes:
   wa_auth:
+  ethol_state:
   # evolution_instances:
