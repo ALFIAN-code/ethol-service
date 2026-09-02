@@ -43,6 +43,7 @@ log = logging.getLogger("absensi-notifier")
 # ── KONFIGURASI — wajib via .env, tidak ada default kredensial di code ──────
 NETID = os.getenv("NETID", "")
 PASSWORD = os.getenv("PASSWORD", "")
+AUTO_PRESENSI = os.getenv("AUTO_PRESENSI", "false").lower() in ("1", "true", "ya", "yes")
 
 # WA gateway pilihan:
 # - Baileys gateway ringan (recommended untuk home server): http://wa-gateway:3000 atau http://localhost:3000
@@ -240,6 +241,163 @@ def send_whatsapp(message: str) -> None:
             log.error("Gagal kirim WA via Evolution ke %s: %s", target, e)
 
 
+def _decode_mahasiswa_id(session: requests.Session) -> int | None:
+    """Ambil mahasiswa id dari JWT token cookie."""
+    token = session.cookies.get("token", "")
+    if not token or "." not in token:
+        return None
+    try:
+        import base64
+
+        payload = token.split(".")[1]
+        # padding
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return int(data.get("nomor") or data.get("id") or 0) or None
+    except Exception:
+        return None
+
+
+def _fetch_presensi_key(session: requests.Session, kuliah: int, jenis_schema: int) -> tuple[str | None, int | None]:
+    """Ambil key & kuliah_asal untuk auto presensi. Return (key, kuliah_asal)."""
+    # endpoint terverifikasi: GET /api/presensi/aktif-kuliah?kuliah=220827&jenis_schema=4 -> [{"kuliah":220827,"key":"brfSY04u8j","jenisSchema":4,"open":1}]
+    candidates = [
+        f"{BASE_URL}/api/presensi/aktif-kuliah?kuliah={kuliah}&jenis_schema={jenis_schema}",
+        f"{BASE_URL}/api/presensi/aktif-kuliah?kuliah={kuliah}&jenisSchema={jenis_schema}",
+        f"{BASE_URL}/api/presensi/mahasiswa?kuliah={kuliah}",
+        f"{BASE_URL}/api/matakuliah/{kuliah}",
+    ]
+    for url in candidates:
+        try:
+            r = session.get(url, timeout=10)
+            if r.ok:
+                j = r.json()
+                if isinstance(j, list):
+                    for item in j:
+                        if isinstance(item, dict) and "key" in item and str(item.get("kuliah")) == str(kuliah):
+                            # cocokkan jenisSchema jika ada
+                            if item.get("jenisSchema") is not None and int(item.get("jenisSchema")) != jenis_schema:
+                                continue
+                            # open 1 = presensi masih buka
+                            if item.get("open") == 0:
+                                log.warning("Presensi %s jenis %s sudah closed (open=0)", kuliah, jenis_schema)
+                            return item.get("key"), item.get("kuliah_asal") or item.get("kuliahAsal")
+                    # fallback: ambil item pertama yang ada key
+                    for item in j:
+                        if isinstance(item, dict) and "key" in item:
+                            return item.get("key"), item.get("kuliah_asal")
+                elif isinstance(j, dict):
+                    if "key" in j:
+                        return j.get("key"), j.get("kuliah_asal") or j.get("kuliahAsal")
+                    for v in j.values():
+                        if isinstance(v, dict) and "key" in v:
+                            return v.get("key"), v.get("kuliah_asal")
+                        if isinstance(v, list):
+                            for item in v:
+                                if isinstance(item, dict) and "key" in item:
+                                    return item.get("key"), item.get("kuliah_asal")
+        except Exception as e:
+            log.debug("Gagal fetch key dari %s: %s", url, e)
+    return None, None
+
+
+def _check_riwayat_presensi(session: requests.Session, kuliah: int, jenis_schema: int, mahasiswa: int) -> bool:
+    """Cek apakah sudah absen via GET /api/presensi/riwayat?kuliah=... True = sudah absen, skip auto."""
+    try:
+        url = f"{BASE_URL}/api/presensi/riwayat?kuliah={kuliah}&jenis_schema={jenis_schema}&nomor={mahasiswa}"
+        r = session.get(url, timeout=10)
+        if r.status_code == 304:
+            # 304 = cache, anggap sudah pernah fetch, coba tanpa If-None-Match
+            r = session.get(url, headers={"If-None-Match": ""}, timeout=10)
+        if r.ok:
+            j = r.json()
+            if isinstance(j, list) and len(j) > 0:
+                # cek tanggal hari ini
+                today = _today_wib()
+                for item in j:
+                    tgl = item.get("tanggal", "")  # "02-09-2026 10:40:20"
+                    try:
+                        # parse "02-09-2026" -> YYYY-MM-DD
+                        d = datetime.strptime(tgl.split()[0], "%d-%m-%Y").date().isoformat()
+                        if d == today:
+                            log.info("Riwayat: sudah absen hari ini %s untuk kuliah %s", today, kuliah)
+                            return True
+                    except Exception:
+                        # kalau parse gagal, anggap sudah absen jika list tidak kosong
+                        return True
+                # jika ada riwayat tapi bukan hari ini, belum absen hari ini
+                return False
+    except Exception as e:
+        log.debug("Gagal cek riwayat %s: %s", kuliah, e)
+    return False
+
+
+def _do_auto_presensi(session: requests.Session, notif: dict) -> tuple[bool, str]:
+    """Eksekusi POST /api/presensi/mahasiswa. Return (sukses, pesan)."""
+    if not AUTO_PRESENSI or notif.get("kodeNotifikasi") != "PRESENSI-KULIAH":
+        return False, "skip (bukan presensi atau AUTO_PRESENSI off)"
+    data_terkait = notif.get("dataTerkait", "")
+    if not data_terkait or "-" not in str(data_terkait):
+        return False, f"dataTerkait invalid: {data_terkait}"
+    try:
+        kuliah_s, jenis_s = str(data_terkait).split("-", 1)
+        kuliah = int(kuliah_s)
+        jenis_schema = int(jenis_s)
+    except Exception:
+        return False, f"parse dataTerkait gagal: {data_terkait}"
+
+    mahasiswa = _decode_mahasiswa_id(session)
+    if not mahasiswa:
+        mahasiswa = 31988  # fallback dari token contoh, akan diisi via JWT
+        log.warning("Gagal decode mahasiswa id dari token, pakai fallback %s", mahasiswa)
+
+    # cek riwayat dulu biar tidak absen dobel
+    if _check_riwayat_presensi(session, kuliah, jenis_schema, mahasiswa):
+        return False, "sudah absen hari ini (cek /riwayat)"
+
+    # ambil key via endpoint terverifikasi: /aktif-kuliah?kuliah=...&jenis_schema=...
+    key, kuliah_asal = _fetch_presensi_key(session, kuliah, jenis_schema)
+    if not key:
+        log.warning("Key presensi untuk kuliah %s jenis %s tidak ditemukan di /aktif-kuliah (closed atau sudah absen)", kuliah, jenis_schema)
+        return False, "key tidak ditemukan (sudah absen/closed, cek /riwayat — /aktif-kuliah return [])"
+
+    # kuliah_asal tidak ada di /aktif-kuliah, coba ambil via matakuliah detail jika masih None
+    if not kuliah_asal:
+        try:
+            r2 = session.get(f"{BASE_URL}/api/matakuliah/{kuliah}", timeout=10)
+            if r2.ok:
+                j2 = r2.json()
+                # bisa langsung dict atau nested
+                if isinstance(j2, dict):
+                    kuliah_asal = j2.get("kuliah_asal") or j2.get("kuliahAsal") or j2.get("id_kuliah_asal")
+                    if not kuliah_asal and "data" in j2 and isinstance(j2["data"], dict):
+                        kuliah_asal = j2["data"].get("kuliah_asal")
+        except Exception:
+            pass
+        kuliah_asal = kuliah_asal or kuliah  # fallback ke kuliah itu sendiri (server biasanya terima)
+
+    payload = {
+        "kuliah": kuliah,
+        "jenis_schema": jenis_schema,
+        "mahasiswa": mahasiswa,
+        "key": key,
+        "kuliah_asal": kuliah_asal,
+    }
+
+    log.info("🚀 Auto presensi: POST %s payload=%s", f"{BASE_URL}/api/presensi/mahasiswa", payload)
+    try:
+        r = session.post(f"{BASE_URL}/api/presensi/mahasiswa", json=payload, timeout=15)
+        j = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        if r.ok and j.get("sukses"):
+            return True, j.get("pesan", "Presensi berhasil disimpan")
+        # kadang sukses true tapi status 200
+        if r.ok:
+            return True, j.get("pesan") or r.text[:200]
+        return False, j.get("pesan") or r.text[:200]
+    except Exception as e:
+        return False, str(e)
+
+
 def format_message(notif: dict) -> str:
     # Format rapi, sesuai field yang ada di pasted-context-2.txt
     kode = notif.get("kodeNotifikasi", "-")
@@ -301,7 +459,7 @@ def _wait_wa_ready(timeout: int = 30) -> bool:
     return False
 
 
-def _send_first_run_test(notifikasi: list[dict]) -> None:
+def _send_first_run_test(session: requests.Session, notifikasi: list[dict]) -> None:
     """Kirim 2-3 notifikasi terbaru hari ini sebagai test saat pertama jalan."""
     if not notifikasi or not SEND_FIRST_RUN_TEST:
         return
@@ -337,7 +495,11 @@ def _send_first_run_test(notifikasi: list[dict]) -> None:
     if not _wait_wa_ready(30):
         log.warning("WA gateway belum connected setelah 30s — test akan dikirim tetap, mungkin gagal. Scan QR di http://localhost:3000/qr")
     for idx, n in enumerate(candidates, 1):
-        test_msg = f"🧪 *TEST {idx}/{len(candidates)} - Notifikasi terbaru hari ini*\n\n" + format_message(n)
+        auto_info = ""
+        if AUTO_PRESENSI and n.get("kodeNotifikasi") == "PRESENSI-KULIAH":
+            ok, pesan = _do_auto_presensi(session, n)
+            auto_info = f"\n\n{'✅ Auto presensi: ' + pesan if ok else '❌ Auto presensi gagal: ' + pesan}"
+        test_msg = f"🧪 *TEST {idx}/{len(candidates)} - Notifikasi terbaru hari ini*\n\n" + format_message(n) + auto_info
         log.info("→ Test %d/%d: %s | %s", idx, len(candidates), n.get("kodeNotifikasi"), n.get("keterangan", "")[:60])
         send_whatsapp(test_msg)
         if idx < len(candidates):
@@ -380,7 +542,13 @@ def run_once(session: requests.Session, seen_ids: set) -> set:
     if baru:
         _log_notif_data("BARU (akan dikirim WA)", sorted(baru, key=lambda x: x["createdAt"]))
     for n in sorted(baru, key=lambda x: x["createdAt"]):
-        msg = format_message(n)
+        # auto presensi jika PRESENSI-KULIAH
+        auto_info = ""
+        if AUTO_PRESENSI and n.get("kodeNotifikasi") == "PRESENSI-KULIAH":
+            ok, pesan = _do_auto_presensi(session, n)
+            auto_info = f"\n\n{'✅ Auto presensi: ' + pesan if ok else '❌ Auto presensi gagal: ' + pesan}"
+            log.info("Auto presensi %s: %s", "sukses" if ok else "gagal", pesan)
+        msg = format_message(n) + auto_info
         log.info("→ Kirim WA:\n%s", msg)
         send_whatsapp(msg)
         seen_ids.add(n["idNotifikasi"])
@@ -413,7 +581,7 @@ def main() -> None:
             save_seen_ids(seen_ids)
             log.info("Baseline %d notifikasi disimpan.", len(seen_ids))
             # kirim 1 notifikasi terbaru hari ini sebagai test (biar ketahuan WA jalan)
-            _send_first_run_test(notifikasi)
+            _send_first_run_test(session, notifikasi)
             log.info("Menunggu polling selanjutnya tiap %ds...", POLL_INTERVAL_SECONDS)
             log.info(
                 "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"

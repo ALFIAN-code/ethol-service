@@ -110,6 +110,9 @@ Penjelasan tiap baris di `.env`:
 | `POLL_INTERVAL_SECONDS` | `180` | Cek setiap 180 detik (3 menit), biarkan saja |
 | `KODE_YANG_DIPANTAU` | kosong | Kosong = semua notif. Isi `PRESENSI-KULIAH` kalau cuma mau absensi |
 | `LOG_LEVEL` | `INFO` | `INFO` = ringkas, `DEBUG` = tampil JSON lengkap |
+| `AUTO_PRESENSI` | `false` | `false` = cuma notif, `true` = auto absen + notif `✅ Auto presensi: ...` |
+| `SEND_FIRST_RUN_TEST` | `true` | `true` = kirim 2-3 chat test di awal |
+| `SEND_FIRST_RUN_TEST_COUNT` | `3` | Jumlah chat test (2 atau 3) |
 
 Simpan: di `nano` tekan `Ctrl+O` → Enter → `Ctrl+X`.
 
@@ -250,7 +253,40 @@ curl -X POST http://localhost:3000/send -H "Content-Type: application/json" \
 
 ---
 
-## 10. Perintah Sehari-hari (Copy-Paste Saja)
+## 10. Auto Presensi (Opsional)
+
+> ⚠️ Hati-hati: auto presensi bisa melanggar aturan kampus jika dosen mewajibkan hadir fisik. Aktifkan hanya jika diizinkan.
+
+Payload yang kamu kirim `{"kuliah":220827,"jenis_schema":4,"mahasiswa":31988,"key":"brfSY04u8j","kuliah_asal":223207}` sudah saya dukung. `key` akan diambil otomatis via `GET /api/presensi/...` lalu `POST /api/presensi/mahasiswa`.
+
+Aktifkan:
+```bash
+nano .env
+# ubah:
+AUTO_PRESENSI=true
+docker compose up -d --build
+docker logs -f ethol_notifier
+```
+
+Log kalau sukses:
+```
+🚀 Auto presensi: POST https://ethol.pens.ac.id/api/presensi/mahasiswa payload={...}
+✅ Auto presensi: Presensi berhasil disimpan
+→ Kirim WA:
+✅ *PRESENSI-KULIAH* ...
+✅ Auto presensi: Presensi berhasil disimpan
+```
+
+Kalau `key` tidak ditemukan:
+```
+⚠️ Key presensi untuk kuliah 220827 tidak ditemukan
+❌ Auto presensi gagal: key tidak ditemukan
+```
+Artinya perlu buka `DevTools` lagi saat presensi dibuka: cek `Network` -> `presensi/mahasiswa` -> tab `Response` atau `Payload` untuk endpoint `GET` yang mengembalikan `key`. Kirim `cURL` lengkap ke saya biar endpoint fetch di `ethol-notification.py:272` bisa diperbaiki.
+
+Matikan lagi: `AUTO_PRESENSI=false` + `docker compose up -d`.
+
+## 11. Perintah Sehari-hari (Copy-Paste Saja)
 
 ```bash
 docker compose logs -f              # lihat semua log (Ctrl+C untuk keluar)
@@ -272,7 +308,81 @@ xdg-open http://localhost:3000/qr   # Linux
 
 ---
 
-## 11. Kalau Error — Panduan Bahasa Awam
+## 12. Ganti IP Otomatis biar Tidak di-Block (Gluetun VPN)
+
+> Default tanpa VPN sudah aman (IP residensial home). Aktifkan ini **hanya** kalau IP kamu kena `403/429` beruntun.
+
+Program bisa lewat VPN tanpa ubah polling logic. Semua request Ethol lewat `gluetun` (IP VPN), WhatsApp tetap direct.
+
+**Langkah untuk pemula:**
+
+**1. Daftar VPN WireGuard:**
+- Paling mudah: **Mullvad** (`mullvad.net` → Generate WireGuard config) atau **ProtonVPN** (free bisa)
+- Download file `.conf` — copy isinya
+
+Contoh `.conf` Mullvad:
+```
+[Interface]
+PrivateKey = abc...
+Address = 10.x.x.x/32
+[Peer]
+PublicKey = xyz...
+Endpoint = 185.x.x.x:51820
+```
+
+**2. Isi `.env`:**
+```bash
+nano .env
+```
+Isi:
+```
+VPN_SERVICE_PROVIDER=custom
+VPN_TYPE=wireguard
+WIREGUARD_PRIVATE_KEY=abc... (dari PrivateKey)
+WIREGUARD_ADDRESSES=10.x.x.x/32
+WIREGUARD_PUBLIC_KEY=xyz... (dari PublicKey)
+WIREGUARD_ENDPOINT_IP=185.x.x.x
+WIREGUARD_ENDPOINT_PORT=51820
+HTTP_PROXY=http://gluetun:8888
+```
+Alternatif Mullvad pakai token (lebih simple):
+```
+VPN_SERVICE_PROVIDER=mullvad
+VPN_TYPE=wireguard
+WIREGUARD_TOKEN=1234abcd...
+SERVER_COUNTRIES=Singapore
+HTTP_PROXY=http://gluetun:8888
+```
+
+**3. Jalankan dengan VPN:**
+```bash
+docker compose --profile vpn up --build -d
+docker logs -f gluetun
+# harus: "VPN connection established"
+curl --proxy http://localhost:8888 https://ifconfig.me
+# IP harus jadi IP VPN, bukan IP rumah
+docker logs -f ethol_notifier
+# polling tetap jalan, tapi lewat VPN
+```
+
+**4. Ganti IP otomatis tiap jam (opsional):**
+```bash
+# tambah di crontab home server:
+crontab -e
+# tambah baris:
+0 * * * * docker restart gluetun
+```
+
+**Tanpa VPN (default):**
+```bash
+docker compose up --build -d
+# atau matikan proxy:
+# di .env kosongkan: HTTP_PROXY=
+```
+
+**Gratis tanpa langganan?** Pakai `Tor` bisa tapi **tidak disarankan** — IP Tor sering di-block Ethol & lambat. Gluetun + Proton free 10GB sudah cukup untuk polling JSON.
+
+## 13. Kalau Error — Panduan Bahasa Awam
 
 | Kamu Lihat | Artinya | Solusi |
 |---|---|---|
@@ -287,7 +397,7 @@ xdg-open http://localhost:3000/qr   # Linux
 
 ---
 
-## 12. Struktur File (Tidak Perlu Diutak-atik)
+## 14. Struktur File (Tidak Perlu Diutak-atik)
 
 ```
 .
@@ -308,7 +418,7 @@ Kamu cuma perlu sentuh `.env`. Sisanya biarkan.
 
 ---
 
-## 13. Keamanan
+## 15. Keamanan
 
 - `.env` sudah ada di `.gitignore`, tidak akan ter-upload ke GitHub.
 - Jangan screenshot `.env` dan share.
