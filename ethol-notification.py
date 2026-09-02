@@ -132,12 +132,12 @@ def login(session: requests.Session) -> None:
     # Step 1: GET cas-redirect (akan redirect ke https://login.pens.ac.id/cas/login?service=...)
     # requests akan follow redirect otomatis, jadi kita dapat HTML CAS langsung
     try:
-        r = _request(session, "get", CAS_REDIRECT_URL, timeout=15, allow_redirects=True)
+        r = _request(session, "get", CAS_REDIRECT_URL, timeout=30, allow_redirects=True)
     except requests.exceptions.ProxyError as e:
         _notify_error_wa("Proxy gluetun error saat login CAS", str(e)[:300])
         raise
-    if r.status_code in (403, 429):
-        _notify_error_wa(f"Ethol block {r.status_code} saat CAS redirect", f"URL: {CAS_REDIRECT_URL}")
+    if r.status_code in (403, 429, 502):
+        _notify_error_wa(f"Ethol {r.status_code} saat CAS redirect", f"URL: {CAS_REDIRECT_URL} | Body: {r.text[:300]}")
     r.raise_for_status()
 
     if 'id="fm1"' not in r.text or 'name="lt"' not in r.text:
@@ -172,7 +172,7 @@ def login(session: requests.Session) -> None:
 
     # Step 2: POST ke CAS login (akan redirect 302 ke /api/auth/cas-callback?ticket=ST-xxx)
     # lalu cas-callback akan set cookie `token` dan redirect lagi ke ethol
-    r2 = _request(session, "post", login_post_url, data=payload, timeout=15, allow_redirects=True)
+    r2 = _request(session, "post", login_post_url, data=payload, timeout=30, allow_redirects=True)
     r2.raise_for_status()
 
     cookies = session.cookies.get_dict()
@@ -190,12 +190,12 @@ def login(session: requests.Session) -> None:
 
 def fetch_notifikasi(session: requests.Session) -> list[dict]:
     try:
-        r = _request(session, "get", NOTIF_URL, timeout=15)
+        r = _request(session, "get", NOTIF_URL, timeout=30)
     except requests.exceptions.ProxyError as e:
         _notify_error_wa("Proxy gluetun error saat fetch notifikasi", str(e)[:300])
         raise
-    if r.status_code in (403, 429):
-        _notify_error_wa(f"Ethol block {r.status_code} saat fetch notifikasi", f"URL: {NOTIF_URL} | Response: {r.text[:300]}")
+    if r.status_code in (403, 429, 502):
+        _notify_error_wa(f"Ethol {r.status_code} saat fetch notifikasi", f"URL: {NOTIF_URL} | Response: {r.text[:300]}")
     if r.status_code == 401:
         raise LoginFailed("Token expired (401 dari API notifikasi).")
     r.raise_for_status()
@@ -631,7 +631,23 @@ def main() -> None:
         raise SystemExit(1)
     log.info("NetID: %s | WA target: %s | Gateway: %s", NETID, ", ".join(WA_TARGETS), WA_GATEWAY_URL or EVOLUTION_BASE_URL)
     session = new_session()
-    login(session)
+    # initial login dengan retry + notif WA (biar tidak crash loop kalau 502/proxy)
+    for attempt in range(1, 6):
+        try:
+            login(session)
+            break
+        except (requests.exceptions.ProxyError, requests.exceptions.ReadTimeout, requests.exceptions.HTTPError) as e:
+            is_502 = "502" in str(e)
+            log.warning("Login gagal attempt %d/5 (%s): %s", attempt, "502 Bad Gateway" if is_502 else "proxy/timeout", e)
+            if attempt == 5:
+                _notify_error_wa("Login awal gagal 5x (Ethol 502/proxy)", str(e)[:400] + "\nCek: gluetun down? Ethol maintenance? HTTP_PROXY diset tapi tanpa --profile vpn?")
+                raise SystemExit(1)
+            _notify_error_wa(f"Login gagal attempt {attempt}/5", str(e)[:400])
+            time.sleep(10 * attempt)
+        except LoginFailed as e:
+            log.error("Login CAS gagal: %s", e)
+            _notify_error_wa("Login CAS gagal", str(e)[:400])
+            raise SystemExit(1)
 
     seen_ids = load_seen_ids()
     # baseline jika file belum ada, kosong, atau invalid -> jangan spam WA lama
