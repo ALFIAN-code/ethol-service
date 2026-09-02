@@ -1,0 +1,6 @@
+.env
+state.json
+wa-gateway/auth_info/
+__pycache__/
+*.pyc
+node_modules/
