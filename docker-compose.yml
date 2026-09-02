@@ -57,13 +57,11 @@ services:
       # Proton OpenVPN (rotate, gratis) — isi OPENVPN_USER/PASSWORD dari Proton -> OpenVPN/IKEv2
       - OPENVPN_USER=${OPENVPN_USER:-}
       - OPENVPN_PASSWORD=${OPENVPN_PASSWORD:-}
-      - SERVER_COUNTRIES=${SERVER_COUNTRIES:-Netherlands, Singapore, United States}
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES:-Netherlands}
       - SERVER_CITIES=${SERVER_CITIES:-}
       - FREE_ONLY=${FREE_ONLY:-on}
       - HTTPPROXY=on
       - HTTPPROXY_LOG=off
-      - HEALTH_VPN_DURATION_INITIAL=30s
-      - DOT=off
     volumes:
       - gluetun:/gluetun
     restart: unless-stopped
