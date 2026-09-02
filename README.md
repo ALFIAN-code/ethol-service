@@ -308,44 +308,80 @@ xdg-open http://localhost:3000/qr   # Linux
 
 ---
 
-## 12. Ganti IP Otomatis biar Tidak di-Block (Gluetun VPN)
+## 12. Ganti IP Otomatis biar Tidak di-Block (Gratis & Berbayar)
 
-> Default tanpa VPN sudah aman (IP residensial home). Aktifkan ini **hanya** kalau IP kamu kena `403/429` beruntun.
+> Default **TANPA VPN/proxy sudah paling aman** (IP residensial home). Aktifkan salah satu di bawah **hanya** kalau kena `403/429` beruntun.
 
-Program bisa lewat VPN tanpa ubah polling logic. Semua request Ethol lewat `gluetun` (IP VPN), WhatsApp tetap direct.
+### Opsi A — ProtonVPN / Windscribe GRATIS via Gluetun (Rekomendasi Gratis)
 
-**Langkah untuk pemula:**
+Paling stabil, tidak sering di-block seperti Tor.
 
-**1. Daftar VPN WireGuard:**
-- Paling mudah: **Mullvad** (`mullvad.net` → Generate WireGuard config) atau **ProtonVPN** (free bisa)
-- Download file `.conf` — copy isinya
-
-Contoh `.conf` Mullvad:
-```
-[Interface]
-PrivateKey = abc...
-Address = 10.x.x.x/32
-[Peer]
-PublicKey = xyz...
-Endpoint = 185.x.x.x:51820
-```
+**1. Daftar gratis:**
+- **ProtonVPN** `protonvpn.com` → Free → Account → Downloads → WireGuard → Generate config (atau OpenVPN → Copy username `xxxx` & password `xxxx`)
+- **Windscribe** `windscribe.com` → Free 10GB → My Account → Setup
 
 **2. Isi `.env`:**
 ```bash
 nano .env
 ```
-Isi:
+Proton WireGuard (copy dari `.conf`):
 ```
 VPN_SERVICE_PROVIDER=custom
 VPN_TYPE=wireguard
-WIREGUARD_PRIVATE_KEY=abc... (dari PrivateKey)
-WIREGUARD_ADDRESSES=10.x.x.x/32
-WIREGUARD_PUBLIC_KEY=xyz... (dari PublicKey)
+WIREGUARD_PRIVATE_KEY=abc...
+WIREGUARD_ADDRESSES=10.2.0.2/32
+WIREGUARD_PUBLIC_KEY=xyz...
 WIREGUARD_ENDPOINT_IP=185.x.x.x
 WIREGUARD_ENDPOINT_PORT=51820
 HTTP_PROXY=http://gluetun:8888
 ```
-Alternatif Mullvad pakai token (lebih simple):
+Proton OpenVPN (lebih gampang, pakai username):
+```
+VPN_SERVICE_PROVIDER=protonvpn
+VPN_TYPE=openvpn
+OPENVPN_USER=xxxx
+OPENVPN_PASSWORD=xxxx
+SERVER_COUNTRIES=Netherlands
+HTTP_PROXY=http://gluetun:8888
+```
+Windscribe:
+```
+VPN_SERVICE_PROVIDER=windscribe
+VPN_TYPE=openvpn
+OPENVPN_USER=username
+OPENVPN_PASSWORD=password
+SERVER_COUNTRIES=Singapore
+HTTP_PROXY=http://gluetun:8888
+```
+
+**3. Jalankan:**
+```bash
+docker compose --profile vpn up --build -d
+docker logs -f gluetun
+# harus: VPN connection established
+curl --proxy http://localhost:8888 https://ifconfig.me
+# IP harus jadi IP VPN
+```
+
+### Opsi B — Tor GRATIS Tanpa Daftar (Paling Gampang, Tapi Lambat)
+
+Tidak perlu VPN account, IP ganti tiap 10 menit otomatis.
+
+```bash
+docker compose --profile tor up --build -d
+# di .env isi:
+HTTP_PROXY=socks5://tor:9050
+docker compose up -d --build
+docker logs -f tor
+curl --proxy socks5://localhost:9050 https://ifconfig.me
+# ganti IP manual:
+docker exec tor kill -HUP $(cat /var/run/tor/tor.pid)
+```
+
+Kekurangan Tor: sering `403` di Ethol & lambat 1-3 detik, hanya pakai kalau Opsi A tidak bisa.
+
+### Opsi C — Berbayar (Mullvad/AirVPN, Paling Cepat)
+Sama seperti Opsi A tapi pakai token Mullvad:
 ```
 VPN_SERVICE_PROVIDER=mullvad
 VPN_TYPE=wireguard
@@ -354,33 +390,19 @@ SERVER_COUNTRIES=Singapore
 HTTP_PROXY=http://gluetun:8888
 ```
 
-**3. Jalankan dengan VPN:**
+**Ganti IP otomatis tiap jam (opsional, semua opsi):**
 ```bash
-docker compose --profile vpn up --build -d
-docker logs -f gluetun
-# harus: "VPN connection established"
-curl --proxy http://localhost:8888 https://ifconfig.me
-# IP harus jadi IP VPN, bukan IP rumah
-docker logs -f ethol_notifier
-# polling tetap jalan, tapi lewat VPN
-```
-
-**4. Ganti IP otomatis tiap jam (opsional):**
-```bash
-# tambah di crontab home server:
 crontab -e
-# tambah baris:
-0 * * * * docker restart gluetun
+0 * * * * docker restart gluetun   # untuk VPN
+0 * * * * docker exec tor kill -HUP $(cat /var/run/tor/tor.pid)  # untuk Tor
 ```
 
-**Tanpa VPN (default):**
+**Kembali tanpa proxy:**
 ```bash
-docker compose up --build -d
-# atau matikan proxy:
-# di .env kosongkan: HTTP_PROXY=
+# di .env kosongkan:
+HTTP_PROXY=
+docker compose up -d --build
 ```
-
-**Gratis tanpa langganan?** Pakai `Tor` bisa tapi **tidak disarankan** — IP Tor sering di-block Ethol & lambat. Gluetun + Proton free 10GB sudah cukup untuk polling JSON.
 
 ## 13. Kalau Error — Panduan Bahasa Awam
 
