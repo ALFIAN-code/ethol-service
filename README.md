@@ -111,6 +111,8 @@ Penjelasan tiap baris di `.env`:
 | `KODE_YANG_DIPANTAU` | kosong | Kosong = semua notif. Isi `PRESENSI-KULIAH` kalau cuma mau absensi |
 | `LOG_LEVEL` | `INFO` | `INFO` = ringkas, `DEBUG` = tampil JSON lengkap |
 | `AUTO_PRESENSI` | `false` | `false` = cuma notif, `true` = auto absen + notif `✅ Auto presensi: ...` |
+| `QUIET_HOURS_ENABLED` | `true` | `true` = pause polling jam 00:00 - 06:00 WIB (malam) |
+| `QUIET_WEEKENDS_ENABLED` | `true` | `true` = pause polling Sabtu & Minggu |
 | `SEND_FIRST_RUN_TEST` | `true` | `true` = kirim 2-3 chat test di awal |
 | `SEND_FIRST_RUN_TEST_COUNT` | `3` | Jumlah chat test (2 atau 3) |
 

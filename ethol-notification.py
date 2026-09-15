@@ -100,6 +100,12 @@ WA_NOTIFY_ERROR = os.getenv("WA_NOTIFY_ERROR", "true").lower() in ("1", "true", 
 WA_NOTIFY_ERROR_COOLDOWN = int(os.getenv("WA_NOTIFY_ERROR_COOLDOWN", "3600"))  # detik, anti spam error
 _last_error_wa = 0
 
+# Jam istirahat & akhir pekan (agar tidak mencurigakan di log Ethol)
+QUIET_HOURS_ENABLED = os.getenv("QUIET_HOURS_ENABLED", "true").lower() in ("1", "true", "ya", "yes")
+QUIET_WEEKENDS_ENABLED = os.getenv("QUIET_WEEKENDS_ENABLED", "true").lower() in ("1", "true", "ya", "yes")
+QUIET_START_HOUR = int(os.getenv("QUIET_START_HOUR", "0"))  # 00:00 WIB
+QUIET_END_HOUR = int(os.getenv("QUIET_END_HOUR", "6"))     # 06:00 WIB
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
 
@@ -472,15 +478,35 @@ def format_message(notif: dict) -> str:
     return f"{emoji} *{kode}*\n{ket}\n\nWaktu: {waktu}\nLink: {link}"
 
 
-def _today_wib() -> str:
-    """Tanggal hari ini di WIB (Asia/Jakarta) format YYYY-MM-DD."""
+def _get_wib_datetime() -> datetime:
+    """Dapatkan datetime saat ini di WIB (Asia/Jakarta)."""
     try:
         from zoneinfo import ZoneInfo
 
-        return datetime.now(ZoneInfo("Asia/Jakarta")).date().isoformat()
+        return datetime.now(ZoneInfo("Asia/Jakarta"))
     except Exception:
-        # fallback UTC+7
-        return (datetime.now(timezone.utc) + timedelta(hours=7)).date().isoformat()
+        return datetime.now(timezone.utc) + timedelta(hours=7)
+
+
+def _today_wib() -> str:
+    """Tanggal hari ini di WIB (Asia/Jakarta) format YYYY-MM-DD."""
+    return _get_wib_datetime().date().isoformat()
+
+
+def _is_quiet_period() -> tuple[bool, str]:
+    """Cek apakah saat ini jam istirahat (00:00 - 06:00 WIB) atau akhir pekan (Sabtu & Minggu)."""
+    now_wib = _get_wib_datetime()
+    weekday = now_wib.weekday()  # 0=Senin, 5=Sabtu, 6=Minggu
+    hour = now_wib.hour
+
+    if QUIET_WEEKENDS_ENABLED and weekday in (5, 6):
+        nama_hari = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"][weekday]
+        return True, f"Akhir pekan ({nama_hari})"
+
+    if QUIET_HOURS_ENABLED and (QUIET_START_HOUR <= hour < QUIET_END_HOUR):
+        return True, f"Jam malam ({QUIET_START_HOUR:02d}:00 - {QUIET_END_HOUR:02d}:00 WIB, saat ini {now_wib.strftime('%H:%M')} WIB)"
+
+    return False, ""
 
 
 def _notif_date_wib(notif: dict) -> str | None:
@@ -678,6 +704,12 @@ def main() -> None:
         log.info("Polling tiap %ds | WA gateway: %s | Cek QR: http://localhost:3000/qr", POLL_INTERVAL_SECONDS, WA_GATEWAY_URL)
 
     while True:
+        is_quiet, reason = _is_quiet_period()
+        if is_quiet:
+            log.info("💤 Polling di-pause: %s. Cek ulang dalam 10 menit...", reason)
+            time.sleep(600)  # tidur 10 menit per iterasi saat quiet period
+            continue
+
         try:
             seen_ids = run_once(session, seen_ids)
             save_seen_ids(seen_ids)
