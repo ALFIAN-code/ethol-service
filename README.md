@@ -404,7 +404,43 @@ HTTP_PROXY=
 docker compose up -d --build
 ```
 
-## 13. Kalau Error — Panduan Bahasa Awam
+## 13. Restart Total (Reset Total — Kalau Mau Mulai Dari Nol)
+
+> Dipakai kalau WA `401 Unauthorized`, mau ganti akun Ethol, atau mau test kirim 3 chat lagi dari awal.
+
+**Reset total (hapus semua history & WA login):**
+```bash
+docker compose down
+docker volume rm ethol-service_wa_auth ethol-service_ethol_state
+# kalau pakai VPN/Tor, tambah:
+docker volume rm ethol-service_gluetun
+docker compose up --build -d
+docker logs -f wa_gateway      # tunggu QR baru -> scan
+docker logs -f ethol_notifier  # akan: Run pertama + 🧪 TEST 3 chat
+```
+
+**Reset tanpa hapus WA (cuma reset notifikasi, biar test lagi):**
+```bash
+docker compose down
+docker volume rm ethol-service_ethol_state
+docker compose up -d --build
+# WA tetap connected, tidak perlu scan ulang
+```
+
+**Reset WA saja (kalau 401 Logged out):**
+```bash
+docker compose down
+docker volume rm ethol-service_wa_auth
+docker compose up -d
+# scan QR baru di http://localhost:3000/qr
+```
+
+Cek volume yang ada:
+```bash
+docker volume ls | grep ethol
+```
+
+## 14. Kalau Error — Panduan Bahasa Awam
 
 | Kamu Lihat | Artinya | Solusi |
 |---|---|---|
@@ -416,10 +452,12 @@ docker compose up -d --build
 | `ENOENT spawn git` saat build | Lupa install git di image | Sudah diperbaiki — `docker compose build wa-gateway` lagi |
 | WA tidak masuk tapi log `terkirim` | WA pengirim ke-disconnect | Cek `curl http://localhost:3000/status`, kalau false scan ulang |
 | Mau ganti HP pengirim | Auth tersimpan di volume | `docker volume rm ethol-service_wa_auth && docker compose up -d` lalu scan ulang |
+| `Connection closed 401` / `Logged out` | Sesi WA expired | Lihat bab 13 Reset WA saja |
+| `Failed to resolve gluetun` | `HTTP_PROXY` ke gluetun tapi tanpa `--profile vpn` | Kosongkan `HTTP_PROXY=` di `.env` atau pakai `--profile vpn` |
 
 ---
 
-## 14. Struktur File (Tidak Perlu Diutak-atik)
+## 15. Struktur File (Tidak Perlu Diutak-atik)
 
 ```
 .
@@ -440,7 +478,7 @@ Kamu cuma perlu sentuh `.env`. Sisanya biarkan.
 
 ---
 
-## 15. Keamanan
+## 16. Keamanan
 
 - `.env` sudah ada di `.gitignore`, tidak akan ter-upload ke GitHub.
 - Jangan screenshot `.env` dan share.

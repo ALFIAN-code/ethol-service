@@ -682,13 +682,14 @@ def main() -> None:
             seen_ids = run_once(session, seen_ids)
             save_seen_ids(seen_ids)
         except LoginFailed as e:
+            # 401 token expired tiap 15 menit itu normal, jangan spam WA
             log.warning("Sesi bermasalah (%s) -> login ulang.", e)
-            _notify_error_wa("Login CAS gagal / token expired", str(e)[:400])
             session = new_session()
             try:
                 login(session)
             except LoginFailed as le:
                 log.error("Login ulang gagal: %s -> retry 30 detik", le)
+                # hanya notif jika gagal 2x berturut (bukan token expired biasa)
                 _notify_error_wa("Login ulang gagal 2x", str(le)[:400])
                 time.sleep(30)
             continue
@@ -697,14 +698,18 @@ def main() -> None:
             _notify_error_wa("Proxy gluetun down / DNS gagal", str(e)[:400] + "\nSolusi: docker compose up -d (tanpa proxy) atau --profile vpn")
             time.sleep(30)
             continue
+        except requests.exceptions.ReadTimeout as e:
+            log.warning("Read timeout (jaringan/VPN lambat): %s", e)
+            _notify_error_wa("Ethol timeout (jaringan/VPN lambat)", str(e)[:400])
+            time.sleep(30)
+            continue
         except Exception as e:
             msg = str(e)
-            is_block = "403" in msg or "429" in msg or "block" in msg.lower()
+            # hanya error jaringan/konteks code, bukan token expired
+            is_network = any(x in msg for x in ("403", "429", "502", "503", "Max retries", "timed out", "Connection", "Proxy"))
             log.error("Error polling: %s", e, exc_info=True)
-            if is_block or "Max retries" in msg:
-                _notify_error_wa("Ethol polling error (mungkin IP ter-block)", msg[:500])
-            else:
-                _notify_error_wa("Ethol polling error umum", msg[:500])
+            if is_network:
+                _notify_error_wa("Ethol jaringan error", msg[:500])
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
