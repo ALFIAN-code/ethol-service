@@ -77,9 +77,9 @@ if _kode_env:
 else:
     KODE_YANG_DIPANTAU = None  # pantau SEMUA (sudah diverifikasi: PRESENSI, TUGAS, PENGUMUMAN ada semua)
 
-BASE_URL = "https://ethol.pens.ac.id"
-CAS_REDIRECT_URL = f"{BASE_URL}/api/auth/cas-redirect"
-NOTIF_URL = f"{BASE_URL}/api/notifikasi/mahasiswa?filterNotif=SEMUA"
+BASE_URL = os.getenv("BASE_URL", "https://ethol.pens.ac.id")
+CAS_REDIRECT_URL = os.getenv("CAS_REDIRECT_URL", f"{BASE_URL}/api/auth/cas-redirect")
+NOTIF_URL = os.getenv("NOTIF_URL", f"{BASE_URL}/api/notifikasi/mahasiswa?filterNotif=SEMUA")
 
 _DATA_DIR = Path(__file__).parent / "data"
 # di Docker, /app/data adalah named volume; di lokal, pakai ./data atau ./state.json fallback
