@@ -106,6 +106,10 @@ QUIET_WEEKENDS_ENABLED = os.getenv("QUIET_WEEKENDS_ENABLED", "true").lower() in 
 QUIET_START_HOUR = int(os.getenv("QUIET_START_HOUR", "0"))  # 00:00 WIB
 QUIET_END_HOUR = int(os.getenv("QUIET_END_HOUR", "6"))     # 06:00 WIB
 
+# Rekap Tugas Harian (pagi/sore)
+REKAP_TUGAS_ENABLED = os.getenv("REKAP_TUGAS_ENABLED", "true").lower() in ("1", "true", "ya", "yes")
+REKAP_TUGAS_JAM = os.getenv("REKAP_TUGAS_JAM", "07:00").strip()  # default 07:00 WIB (bisa diatur 18:00 dll)
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
 
@@ -212,26 +216,33 @@ def fetch_notifikasi(session: requests.Session) -> list[dict]:
     return data
 
 
-def load_seen_ids() -> set:
+def load_seen_state() -> tuple[set, str | None]:
     try:
         if STATE_FILE.is_file():
             text = STATE_FILE.read_text().strip()
-            if not text:
-                return set()
-            return set(json.loads(text))
+            if text:
+                data = json.loads(text)
+                if isinstance(data, dict):
+                    return set(data.get("seen_ids", [])), data.get("last_rekap_date")
+                elif isinstance(data, list):
+                    return set(data), None
     except Exception as e:
         log.warning("Gagal load state.json: %s", e)
-    return set()
+    return set(), None
 
 
-def save_seen_ids(ids: set) -> None:
+def save_seen_state(ids: set, last_rekap_date: str | None = None) -> None:
     try:
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         if STATE_FILE.exists() and not STATE_FILE.is_file():
             import shutil
 
             shutil.rmtree(STATE_FILE)
-        STATE_FILE.write_text(json.dumps(list(ids)))
+        payload = {
+            "seen_ids": list(ids),
+            "last_rekap_date": last_rekap_date,
+        }
+        STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
         # backward compat: hapus file lama di root jika pakai volume baru
         _old = Path(__file__).parent / "state.json"
         if STATE_FILE != _old and _old.is_file():
@@ -241,6 +252,16 @@ def save_seen_ids(ids: set) -> None:
                 pass
     except Exception as e:
         log.error("Gagal save state.json (%s): %s", STATE_FILE, e)
+
+
+def load_seen_ids() -> set:
+    ids, _ = load_seen_state()
+    return ids
+
+
+def save_seen_ids(ids: set) -> None:
+    _, last_rekap = load_seen_state()
+    save_seen_state(ids, last_rekap)
 
 
 def _should_notify_error() -> bool:
@@ -467,15 +488,232 @@ def _do_auto_presensi(session: requests.Session, notif: dict) -> tuple[bool, str
         return False, str(e)
 
 
+def _parse_kuliah_params(notif: dict) -> tuple[int | None, int]:
+    """Ekstrak kuliah ID dan jenisSchema dari urlWeb notifikasi (contoh: /matakuliah/220851/tugas)."""
+    url = notif.get("urlWeb", "")
+    data_terkait = notif.get("dataTerkait", "")
+    kuliah = None
+    jenis_schema = 4  # default jenisSchema
+
+    # coba parse dari urlWeb (/matakuliah/220851/...)
+    if "/matakuliah/" in url:
+        try:
+            parts = url.split("/matakuliah/")[1].split("/")
+            kuliah = int(parts[0])
+        except Exception:
+            pass
+
+    # fallback dari dataTerkait jika format ID-jenis (contoh: 220851-4)
+    if not kuliah and "-" in str(data_terkait):
+        try:
+            k, j = str(data_terkait).split("-", 1)
+            kuliah = int(k)
+            jenis_schema = int(j)
+        except Exception:
+            pass
+
+    return kuliah, jenis_schema
+
+
+def _fetch_tugas_list(session: requests.Session, kuliah: int, jenis_schema: int = 4) -> list[dict]:
+    """Fetch daftar tugas lengkap suatu matakuliah dari GET /api/tugas?kuliah=xxx&jenisSchema=4."""
+    url = f"{BASE_URL}/api/tugas?kuliah={kuliah}&jenisSchema={jenis_schema}"
+    try:
+        r = _request(session, "get", url, timeout=10)
+        if r.ok:
+            j = r.json()
+            if isinstance(j, list):
+                return j
+    except Exception as e:
+        log.debug("Gagal fetch /api/tugas kuliah %s: %s", kuliah, e)
+    return []
+
+
+def _fetch_detail_tugas_by_id(session: requests.Session, kuliah: int, id_tugas: int, jenis_schema: int = 4) -> dict | None:
+    """Cari tugas spesifik dari list /api/tugas berdasarkan ID tugas."""
+    tugas_list = _fetch_tugas_list(session, kuliah, jenis_schema)
+    for t in tugas_list:
+        if isinstance(t, dict) and t.get("id") == id_tugas:
+            return t
+    return None
+
+
 def format_message(notif: dict) -> str:
     # Format rapi, sesuai field yang ada di pasted-context-2.txt
     kode = notif.get("kodeNotifikasi", "-")
     ket = notif.get("keterangan", "-")
     waktu = notif.get("createdAtIndonesia", notif.get("waktuNotifikasi", "-"))
-    url = notif.get("urlWeb", "")
-    link = f"{BASE_URL}{url}" if url else "-"
     emoji = {"PRESENSI-KULIAH": "✅", "TUGAS-BARU": "📝", "PENGUMUMAN-BARU": "📢"}.get(kode, "🔔")
-    return f"{emoji} *{kode}*\n{ket}\n\nWaktu: {waktu}\nLink: {link}"
+    return f"{emoji} *{kode}*\n{ket}\n\nWaktu: {waktu}"
+
+
+def format_message_tugas(notif: dict, session: requests.Session | None = None) -> str:
+    """Format khusus pesan notifikasi TUGAS-BARU dengan mengambil deadline resmi dari /api/tugas."""
+    ket = notif.get("keterangan", "-")
+    data_terkait = notif.get("dataTerkait", "")
+
+    deadline_str = None
+    if session and data_terkait.isdigit():
+        id_tugas = int(data_terkait)
+        kuliah, jenis_schema = _parse_kuliah_params(notif)
+        if kuliah:
+            detail = _fetch_detail_tugas_by_id(session, kuliah, id_tugas, jenis_schema)
+            if detail:
+                deadline_str = detail.get("deadline_indonesia") or detail.get("deadline")
+
+    msg = f"📝 *TUGAS-BARU*\n{ket}"
+    if deadline_str:
+        msg += f"\n\n⏰ *Tenggat Waktu:* {deadline_str}"
+    else:
+        msg += f"\n\nWaktu Notif: {notif.get('createdAtIndonesia', '-')}"
+    return msg
+
+
+def _fetch_all_kuliah(session: requests.Session) -> list[dict]:
+    """Fetch daftar seluruh matakuliah mahasiswa dari GET /api/kuliah."""
+    now_wib = _get_wib_datetime()
+    year = now_wib.year
+    candidates = [
+        f"{BASE_URL}/api/kuliah",
+        f"{BASE_URL}/api/kuliah?tahun={year}&semester=1",
+        f"{BASE_URL}/api/kuliah?tahun={year}&semester=2",
+    ]
+    for url in candidates:
+        try:
+            r = _request(session, "get", url, timeout=10)
+            if r.ok:
+                j = r.json()
+                if isinstance(j, list) and len(j) > 0:
+                    return j
+        except Exception as e:
+            log.debug("Gagal fetch /api/kuliah (%s): %s", url, e)
+    return []
+
+
+def _calculate_deadline_badge(deadline_raw: str | None, now_wib: datetime) -> tuple[str, datetime | None]:
+    """Hitung sisa waktu dan return (badge_text, deadline_datetime)."""
+    if not deadline_raw:
+        return "📌 Waktu tidak diketahui", None
+
+    dt = None
+    try:
+        dt = datetime.strptime(str(deadline_raw).strip(), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        try:
+            dt = datetime.fromisoformat(str(deadline_raw).replace("Z", "+00:00"))
+        except Exception:
+            pass
+
+    if not dt:
+        return f"📌 {deadline_raw}", None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=now_wib.tzinfo)
+
+    diff = dt - now_wib
+    days = (dt.date() - now_wib.date()).days
+
+    if diff.total_seconds() < 0:
+        return "❌ TERLEWAT (Sudah Kadaluarsa)", dt
+
+    if days == 0:
+        hours = int(diff.total_seconds() // 3600)
+        mins = int((diff.total_seconds() % 3600) // 60)
+        return f"🚨 HARI INI (Jatuh Tempo Hari Ini! Sisa {hours}j {mins}m)", dt
+    elif days == 1:
+        return "⚠️ H-1 (Tenggat Besok!)", dt
+    elif days > 1:
+        return f"📌 H-{days} (Sisa {days} hari)", dt
+
+    return "📌 Sisa Waktu Mepet", dt
+
+
+def _format_datetime_wib_indo(dt: datetime) -> str:
+    """Format datetime ke string Bahasa Indonesia (contoh: Senin, 28 September 2026 - 18:18 WIB)."""
+    days = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+    months = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
+    day_name = days[dt.weekday()]
+    month_name = months[dt.month - 1]
+    return f"{day_name}, {dt.day:02d} {month_name} {dt.year} - {dt.strftime('%H:%M')} WIB"
+
+
+def generate_rekap_tugas(session: requests.Session) -> str:
+    """Buat ringkasan rekap semua tugas dari API Ethol (menggunakan /api/kuliah & /api/tugas)."""
+    now_wib = _get_wib_datetime()
+    now_str = _format_datetime_wib_indo(now_wib)
+
+    kuliah_list = _fetch_all_kuliah(session)
+
+    pending_list = []
+    submitted_list = []
+
+    if kuliah_list:
+        for item in kuliah_list:
+            if not isinstance(item, dict):
+                continue
+            kuliah_id = item.get("nomor")
+            jenis_schema = item.get("jenisSchema", 4)
+            matkul_info = item.get("matakuliah") or {}
+            matkul_nama = matkul_info.get("nama") if isinstance(matkul_info, dict) else "Matakuliah"
+
+            # Nama dosen murni tanpa gelar
+            full_dosen = (item.get("dosen") or "").strip() or "-"
+
+            if not kuliah_id:
+                continue
+
+            tugas_list = _fetch_tugas_list(session, int(kuliah_id), int(jenis_schema))
+
+            for t in tugas_list:
+                if not isinstance(t, dict):
+                    continue
+
+                title = t.get("title", "Tugas")
+                deadline_indo = t.get("deadline_indonesia") or t.get("deadline", "-")
+                deadline_raw = t.get("deadline")
+                submitted = t.get("submission_time") is not None
+                is_closed = t.get("tutup") == 1
+
+                badge, dt = _calculate_deadline_badge(deadline_raw, now_wib)
+
+                if submitted:
+                    submitted_list.append({
+                        "text": f"• *{title}* ({matkul_nama})"
+                    })
+                else:
+                    # Jangan tampilkan yang sudah ditutup jika belum dikerjakan lebih dari 7 hari
+                    if is_closed and dt and (now_wib - dt).days > 7:
+                        continue
+                    pending_list.append({
+                        "dt": dt or datetime.max.replace(tzinfo=now_wib.tzinfo),
+                        "text": (
+                            f"• *{title}*\n"
+                            f"  📚 *Matkul:* {matkul_nama}\n"
+                            f"  👨‍🏫 *Dosen:* {full_dosen}\n"
+                            f"  ⏰ *Tenggat:* {deadline_indo}\n"
+                            f"  🏷️ *Status:* {badge}"
+                        )
+                    })
+
+    # Urutkan pending tugas berdasarkan deadline terkecil (paling mepet di atas)
+    pending_list.sort(key=lambda x: x["dt"])
+
+    header = f"📋 *REKAP TUGAS ETHOL*\n📅 {now_str}\n"
+    sections = []
+
+    if pending_list:
+        p_texts = [p["text"] for p in pending_list]
+        sections.append(f"🔴 *BELUM DIKERJAKAN ({len(pending_list)} Tugas):*\n\n" + "\n\n".join(p_texts))
+
+    if submitted_list:
+        sections.append(f"✅ *SUDAH DIKERJAKAN:* {len(submitted_list)} tugas selesai")
+
+    if not pending_list:
+        if submitted_list:
+            return f"{header}\n🎉 *Bebas Tugas!* Semua tugas sudah kamu kerjakan."
+        return f"{header}\n🎉 Tidak ada tugas aktif! Semua aman."
+
+    return header + "\n\n" + "\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n".join(sections)
 
 
 def _get_wib_datetime() -> datetime:
@@ -588,7 +826,13 @@ def _send_first_run_test(session: requests.Session, notifikasi: list[dict]) -> N
         if AUTO_PRESENSI and n.get("kodeNotifikasi") == "PRESENSI-KULIAH":
             ok, pesan = _do_auto_presensi(session, n)
             auto_info = f"\n\n{'✅ Auto presensi: ' + pesan if ok else '❌ Auto presensi gagal: ' + pesan}"
-        test_msg = f"🧪 *TEST {idx}/{len(candidates)} - Notifikasi terbaru hari ini*\n\n" + format_message(n) + auto_info
+
+        if n.get("kodeNotifikasi") == "TUGAS-BARU":
+            fmt_body = format_message_tugas(n, session)
+        else:
+            fmt_body = format_message(n) + auto_info
+
+        test_msg = f"🧪 *TEST {idx}/{len(candidates)} - Notifikasi terbaru hari ini*\n\n" + fmt_body
         log.info("→ Test %d/%d: %s | %s", idx, len(candidates), n.get("kodeNotifikasi"), n.get("keterangan", "")[:60])
         send_whatsapp(test_msg)
         if idx < len(candidates):
@@ -637,7 +881,12 @@ def run_once(session: requests.Session, seen_ids: set) -> set:
             ok, pesan = _do_auto_presensi(session, n)
             auto_info = f"\n\n{'✅ Auto presensi: ' + pesan if ok else '❌ Auto presensi gagal: ' + pesan}"
             log.info("Auto presensi %s: %s", "sukses" if ok else "gagal", pesan)
-        msg = format_message(n) + auto_info
+
+        if n.get("kodeNotifikasi") == "TUGAS-BARU":
+            msg = format_message_tugas(n, session)
+        else:
+            msg = format_message(n) + auto_info
+
         log.info("→ Kirim WA:\n%s", msg)
         send_whatsapp(msg)
         seen_ids.add(n["idNotifikasi"])
@@ -675,7 +924,7 @@ def main() -> None:
             _notify_error_wa("Login CAS gagal", str(e)[:400])
             raise SystemExit(1)
 
-    seen_ids = load_seen_ids()
+    seen_ids, last_rekap_date = load_seen_state()
     # baseline jika file belum ada, kosong, atau invalid -> jangan spam WA lama
     if not STATE_FILE.is_file() or len(seen_ids) == 0:
         log.info("Run pertama / state kosong: menyimpan baseline + kirim 1 test hari ini untuk verifikasi.")
@@ -683,7 +932,7 @@ def main() -> None:
             notifikasi = fetch_notifikasi(session)
             _log_notif_data("BASELINE (disimpan)", notifikasi)
             seen_ids = {n["idNotifikasi"] for n in notifikasi}
-            save_seen_ids(seen_ids)
+            save_seen_state(seen_ids, last_rekap_date)
             log.info("Baseline %d notifikasi disimpan.", len(seen_ids))
             # kirim 1 notifikasi terbaru hari ini sebagai test (biar ketahuan WA jalan)
             _send_first_run_test(session, notifikasi)
@@ -700,8 +949,8 @@ def main() -> None:
             log.error("Gagal baseline: %s", e)
             seen_ids = set()
     else:
-        log.info("Load %d seen_ids dari state.json", len(seen_ids))
-        log.info("Polling tiap %ds | WA gateway: %s | Cek QR: http://localhost:3000/qr", POLL_INTERVAL_SECONDS, WA_GATEWAY_URL)
+        log.info("Load %d seen_ids dari state.json (last rekap: %s)", len(seen_ids), last_rekap_date or "belum pernah")
+        log.info("Polling tiap %ds | WA gateway: %s | Rekap tugas: %s (jam %s WIB)", POLL_INTERVAL_SECONDS, WA_GATEWAY_URL, "ON" if REKAP_TUGAS_ENABLED else "OFF", REKAP_TUGAS_JAM)
 
     while True:
         is_quiet, reason = _is_quiet_period()
@@ -710,9 +959,26 @@ def main() -> None:
             time.sleep(600)  # tidur 10 menit per iterasi saat quiet period
             continue
 
+        # Cek & kirim rekap harian tugas jika sudah masuk jam REKAP_TUGAS_JAM
+        now_wib = _get_wib_datetime()
+        today_str = now_wib.date().isoformat()
+        current_hm = now_wib.strftime("%H:%M")
+
+        if REKAP_TUGAS_ENABLED and current_hm >= REKAP_TUGAS_JAM and last_rekap_date != today_str:
+            log.info("📋 Waktu rekap tugas (%s WIB >= %s WIB) -> generate & kirim rekap ke WA...", current_hm, REKAP_TUGAS_JAM)
+            try:
+                rekap_msg = generate_rekap_tugas(session)
+                log.info("→ Kirim Rekap Tugas WA:\n%s", rekap_msg)
+                send_whatsapp(rekap_msg)
+                last_rekap_date = today_str
+                save_seen_state(seen_ids, last_rekap_date)
+                log.info("✅ Rekap tugas harian berhasil terkirim.")
+            except Exception as re:
+                log.error("Gagal kirim rekap tugas harian: %s", re)
+
         try:
             seen_ids = run_once(session, seen_ids)
-            save_seen_ids(seen_ids)
+            save_seen_state(seen_ids, last_rekap_date)
         except LoginFailed as e:
             # 401 token expired tiap 15 menit itu normal, jangan spam WA
             log.warning("Sesi bermasalah (%s) -> login ulang.", e)
