@@ -20,6 +20,7 @@ Cara pakai:
 import json
 import logging
 import os
+import random
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -109,6 +110,10 @@ QUIET_END_HOUR = int(os.getenv("QUIET_END_HOUR", "6"))     # 06:00 WIB
 # Rekap Tugas Harian (pagi/sore)
 REKAP_TUGAS_ENABLED = os.getenv("REKAP_TUGAS_ENABLED", "true").lower() in ("1", "true", "ya", "yes")
 REKAP_TUGAS_JAM = os.getenv("REKAP_TUGAS_JAM", "07:00").strip()  # default 07:00 WIB (bisa diatur 18:00 dll)
+REKAP_TUGAS_WEEKENDS_ENABLED = os.getenv("REKAP_TUGAS_WEEKENDS_ENABLED", "false").lower() in ("1", "true", "ya", "yes")
+
+# Dynamic Polling & Random Jitter (biar menyerupai perilaku manusia & anti-bot)
+DYNAMIC_POLLING_ENABLED = os.getenv("DYNAMIC_POLLING_ENABLED", "true").lower() in ("1", "true", "ya", "yes")
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
@@ -747,6 +752,34 @@ def _is_quiet_period() -> tuple[bool, str]:
     return False, ""
 
 
+def _calculate_next_sleep_seconds() -> tuple[int, str]:
+    """Hitung interval polling dinamis dengan jitter acak agar menyerupai perilaku manusia."""
+    now_wib = _get_wib_datetime()
+    weekday = now_wib.weekday()  # 0=Senin, 5=Sabtu, 6=Minggu
+    hour = now_wib.hour
+
+    if not DYNAMIC_POLLING_ENABLED:
+        jitter = random.randint(-15, 15)
+        sleep_sec = max(30, POLL_INTERVAL_SECONDS + jitter)
+        return sleep_sec, f"Interval tetap ({sleep_sec} detik)"
+
+    if weekday in (5, 6):
+        sleep_sec = random.randint(1800, 2700)
+        return sleep_sec, f"Akhir pekan (30-45m, next in {sleep_sec // 60}m)"
+
+    if hour >= 22 or hour < 6:
+        sleep_sec = random.randint(1800, 2700)
+        return sleep_sec, f"Jam malam (30-45m, next in {sleep_sec // 60}m)"
+
+    if 17 <= hour < 22:
+        sleep_sec = random.randint(420, 720)
+        return sleep_sec, f"Kuliah malam (7-12m, next in {sleep_sec // 60}m {sleep_sec % 60}s)"
+
+    # 07:00 - 17:00 (Jam kuliah utama)
+    sleep_sec = random.randint(300, 540)
+    return sleep_sec, f"Jam kuliah utama (5-9m, next in {sleep_sec // 60}m {sleep_sec % 60}s)"
+
+
 def _notif_date_wib(notif: dict) -> str | None:
     """Ambil tanggal notifikasi dalam WIB dari createdAt (UTC) atau createdAtIndonesia."""
     # coba parse createdAt dulu (ISO8601 UTC)
@@ -963,8 +996,11 @@ def main() -> None:
         now_wib = _get_wib_datetime()
         today_str = now_wib.date().isoformat()
         current_hm = now_wib.strftime("%H:%M")
+        is_weekend = now_wib.weekday() in (5, 6)
 
-        if REKAP_TUGAS_ENABLED and current_hm >= REKAP_TUGAS_JAM and last_rekap_date != today_str:
+        should_rekap = REKAP_TUGAS_ENABLED and (not is_weekend or REKAP_TUGAS_WEEKENDS_ENABLED)
+
+        if should_rekap and current_hm >= REKAP_TUGAS_JAM and last_rekap_date != today_str:
             log.info("📋 Waktu rekap tugas (%s WIB >= %s WIB) -> generate & kirim rekap ke WA...", current_hm, REKAP_TUGAS_JAM)
             try:
                 rekap_msg = generate_rekap_tugas(session)
@@ -1009,7 +1045,9 @@ def main() -> None:
             if is_network:
                 _notify_error_wa("Ethol jaringan error", msg[:500])
 
-        time.sleep(POLL_INTERVAL_SECONDS)
+        sleep_sec, sleep_info = _calculate_next_sleep_seconds()
+        log.info("💤 Polling berikutnya: %s", sleep_info)
+        time.sleep(sleep_sec)
 
 
 if __name__ == "__main__":

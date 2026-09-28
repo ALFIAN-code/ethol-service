@@ -113,6 +113,8 @@ Penjelasan tiap baris di `.env`:
 | `AUTO_PRESENSI` | `false` | `false` = cuma notif, `true` = auto absen + notif `✅ Auto presensi: ...` |
 | `REKAP_TUGAS_ENABLED` | `true` | `true` = kirim rekap ringkasan semua tugas harian di jam tertentu |
 | `REKAP_TUGAS_JAM` | `07:00` | Waktu pengiriman rekap (format HH:MM WIB, misal `07:00` atau `18:00`) |
+| `REKAP_TUGAS_WEEKENDS_ENABLED` | `false` | `false` = tidak kirim rekap tugas pada hari Sabtu & Minggu |
+| `DYNAMIC_POLLING_ENABLED` | `true` | `true` = interval acak 5-9m (jam kuliah) & 7-12m (sore) agar anti-bot |
 | `QUIET_HOURS_ENABLED` | `true` | `true` = pause polling jam 00:00 - 06:00 WIB (malam) |
 | `QUIET_WEEKENDS_ENABLED` | `true` | `true` = pause polling Sabtu & Minggu |
 | `SEND_FIRST_RUN_TEST` | `true` | `true` = kirim 2-3 chat test di awal |
